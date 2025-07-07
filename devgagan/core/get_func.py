@@ -18,9 +18,10 @@ import time
 import gc
 import os
 import re
+import math
+import aiofiles
 from typing import Callable
 from devgagan import app
-import aiofiles
 from devgagan import sex as gf
 from telethon.tl.types import DocumentAttributeVideo, Message
 from telethon.sessions import StringSession
@@ -56,7 +57,15 @@ if STRING:
 else:
     pro = None
     print("STRING is not available. 'app' is set to None.")
-    
+
+def convert_bytes(size):
+    """Convert bytes to human-readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
+
 async def fetch_upload_method(user_id):
     """Fetch the user's preferred upload method."""
     user_data = collection.find_one({"user_id": user_id})
@@ -74,12 +83,10 @@ async def format_caption_to_html(caption: str) -> str:
     caption = re.sub(r"\|\|(.*?)\|\|", r"<details>\1</details>", caption)
     caption = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', caption)
     return caption.strip() if caption else None
-    
-
 
 async def upload_media(sender, target_chat_id, file, caption, edit, topic_id):
     try:
-        upload_method = await fetch_upload_method(sender)  # Fetch the upload method (Pyrogram or Telethon)
+        upload_method = await fetch_upload_method(sender)
         metadata = video_metadata(file)
         width, height, duration = metadata['width'], metadata['height'], metadata['duration']
         try:
@@ -182,10 +189,70 @@ async def upload_media(sender, target_chat_id, file, caption, edit, topic_id):
 
     finally:
         if thumb_path and os.path.exists(thumb_path):
-            if os.path.basename(thumb_path) != f"{sender}.jpg":  # Check if the filename is not {sender}.jpg
+            if os.path.basename(thumb_path) != f"{sender}.jpg":
                 os.remove(thumb_path)
         gc.collect()
 
+async def split_and_upload_file(app, sender, target_chat_id, file_path, caption, topic_id):
+    if not os.path.exists(file_path):
+        await app.send_message(sender, "❌ File not found!")
+        return
+
+    file_size = os.path.getsize(file_path)
+    PART_SIZE = 2 * 1024 * 1024 * 1024  # 2GB per part
+    total_parts = (file_size + PART_SIZE - 1) // PART_SIZE  # Ceiling division
+
+    # Send initial status message
+    status_msg = await app.send_message(
+        sender,
+        f"📁 **Splitting file into {total_parts} parts...**\n"
+        f"⚙️ Total size: {convert_bytes(file_size)}"
+    )
+
+    part_number = 1
+    async with aiofiles.open(file_path, "rb") as main_file:
+        while True:
+            # Read 2GB chunk
+            chunk = await main_file.read(PART_SIZE)
+            if not chunk:
+                break
+
+            # Create part file
+            base_name = os.path.basename(file_path)
+            part_filename = f"{base_name}.part{part_number:03d}"
+            async with aiofiles.open(part_filename, "wb") as part_file:
+                await part_file.write(chunk)
+
+            # Create upload progress message
+            progress_msg = await app.send_message(
+                target_chat_id,
+                f"⬆️ **Uploading Part {part_number}/{total_parts}**\n"
+                f"📦 `{part_filename}`"
+            )
+
+            # Upload with progress tracking
+            await app.send_document(
+                chat_id=target_chat_id,
+                document=part_filename,
+                caption=f"{caption}\n\n**Part {part_number}/{total_parts}**",
+                reply_to_message_id=topic_id,
+                progress=progress_bar,
+                progress_args=(
+                    f"╭─────────────────────╮\n│ **Part {part_number}/{total_parts} Uploading...**\n├─────────────────────",
+                    progress_msg,
+                    time.time()
+                )
+            )
+            
+            # Cleanup part file and progress message
+            os.remove(part_filename)
+            await progress_msg.delete()
+            part_number += 1
+
+    # Final cleanup
+    await status_msg.delete()
+    os.remove(file_path)
+    await app.send_message(sender, f"✅ **Successfully uploaded {total_parts} file parts!**")
 
 async def get_msg(userbot, sender, edit_id, msg_link, i, message):
     try:
@@ -193,7 +260,7 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
         msg_link = msg_link.split("?single")[0]
         chat, msg_id = None, None
         saved_channel_ids = load_saved_channel_ids()
-        size_limit = 2 * 1024 * 1024 * 1024  # 1.99 GB size limit
+        size_limit = 2 * 1024 * 1024 * 1024  # 2 GB size limit
         file = ''
         edit = ''
         # Extract chat and message ID for valid Telegram links
@@ -201,7 +268,7 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
             parts = msg_link.split("/")
             if 't.me/b/' in msg_link:
                 chat = parts[-2]
-                msg_id = int(parts[-1]) + i # fixed bot problem 
+                msg_id = int(parts[-1]) + i
             else:
                 chat = int('-100' + parts[parts.index('c') + 1])
                 msg_id = int(parts[-1]) + i
@@ -213,15 +280,15 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
                 )
                 return
             
-        elif '/s/' in msg_link: # fixed story typo
-            edit = await app.edit_message_text(sender, edit_id, "Story Link Dictected...")
+        elif '/s/' in msg_link:
+            edit = await app.edit_message_text(sender, edit_id, "Story Link Detected...")
             if userbot is None:
                 await edit.edit("Login in bot save stories...")     
                 return
             parts = msg_link.split("/")
             chat = parts[3]
             
-            if chat.isdigit():   # this is for channel stories
+            if chat.isdigit():
                 chat = f"-100{chat}"
             
             msg_id = int(parts[-1])
@@ -264,10 +331,6 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
         
         # Handle file media (photo, document, video)
         file_size = get_message_file_size(msg)
-
-        # if file_size and file_size > size_limit and pro is None:
-        #     await app.edit_message_text(sender, edit_id, "**❌ 4GB Uploader not found**")
-        #     return
 
         file_name = await get_media_filename(msg)
         edit = await app.edit_message_text(sender, edit_id, "**Downloading...**")
@@ -314,28 +377,23 @@ async def get_msg(userbot, sender, edit_id, msg_link, i, message):
             return
 
         # Upload media
-        # await edit.edit("**Checking file...**")
-        if file_size > size_limit and (free_check == 1 or pro is None):
+        if file_size > size_limit:
             await edit.delete()
             await split_and_upload_file(app, sender, target_chat_id, file, caption, topic_id)
             return
-        elif file_size > size_limit:
-            await handle_large_file(file, sender, edit, caption)
         else:
             await upload_media(sender, target_chat_id, file, caption, edit, topic_id)
 
     except (ChannelBanned, ChannelInvalid, ChannelPrivate, ChatIdInvalid, ChatInvalid):
         await app.edit_message_text(sender, edit_id, "Have you joined the channel?")
     except Exception as e:
-        # await app.edit_message_text(sender, edit_id, f"Failed to save: `{msg_link}`\n\nError: {str(e)}")
         print(f"Error: {e}")
     finally:
-        # Clean up
         if file and os.path.exists(file):
             os.remove(file)
         if edit:
             await edit.delete(2)
-        
+
 async def clone_message(app, msg, target_chat_id, topic_id, edit_id, log_group):
     edit = await app.edit_message_text(target_chat_id, edit_id, "Cloning...")
     devgaganin = await app.send_message(target_chat_id, msg.text.markdown, reply_to_message_id=topic_id)
@@ -375,7 +433,6 @@ def get_message_file_size(msg):
     return 1
 
 async def get_final_caption(msg, sender):
-    # Handle caption based on the upload method
     if msg.caption:
         original_caption = msg.caption.markdown
     else:
@@ -392,7 +449,6 @@ async def get_final_caption(msg, sender):
 
 async def download_user_stories(userbot, chat_id, msg_id, edit, sender):
     try:
-        # Fetch the story using the provided chat ID and message ID
         story = await userbot.get_stories(chat_id, msg_id)
         if not story:
             await edit.edit("No story available for this user.")
@@ -403,7 +459,6 @@ async def download_user_stories(userbot, chat_id, msg_id, edit, sender):
         await edit.edit("Downloading Story...")
         file_path = await userbot.download_media(story)
         print(f"Story downloaded: {file_path}")
-        # Send the downloaded story based on its type
         if story.media:
             await edit.edit("Uploading Story...")
             if story.media == MessageMediaType.VIDEO:
@@ -474,13 +529,10 @@ async def copy_message_with_chat_id(app, userbot, sender, chat_id, message_id, e
             elif msg.video or msg.document:
                 freecheck = await chk_user(chat_id, sender)
                 file_size = get_message_file_size(msg)
-                if file_size > size_limit and (freecheck == 1 or pro is None):
+                if file_size > size_limit:
                     await edit.delete()
-                    await split_and_upload_file(app, sender, target_chat_id, file, caption, topic_id)
+                    await split_and_upload_file(app, sender, target_chat_id, file, final_caption, topic_id)
                     return       
-                elif file_size > size_limit:
-                    await handle_large_file(file, sender, edit, final_caption)
-                    return
                 await upload_media(sender, target_chat_id, file, final_caption, edit, topic_id)
             elif msg.audio:
                 result = await app.send_audio(target_chat_id, file, caption=final_caption, reply_to_message_id=topic_id)
@@ -494,14 +546,6 @@ async def copy_message_with_chat_id(app, userbot, sender, chat_id, message_id, e
     except Exception as e:
         print(f"Error : {e}")
         pass
-        #error_message = f"Error occurred while processing message: {str(e)}"
-        # await app.send_message(sender, error_message)
-        # await app.send_message(sender, f"Make Bot admin in your Channel - {target_chat_id} and restart the process after /cancel")
-
-    finally:
-        if file and os.path.exists(file):
-            os.remove(file)
-
 
 async def send_media_message(app, target_chat_id, msg, caption, topic_id):
     try:
@@ -514,7 +558,6 @@ async def send_media_message(app, target_chat_id, msg, caption, topic_id):
     except Exception as e:
         print(f"Error while sending media: {e}")
     
-    # Fallback to copy_message in case of any exceptions
     return await app.copy_message(target_chat_id, msg.chat.id, msg.id, reply_to_message_id=topic_id)
     
 
@@ -522,13 +565,11 @@ def format_caption(original_caption, sender, custom_caption):
     delete_words = load_delete_words(sender)
     replacements = load_replacement_words(sender)
 
-    # Remove and replace words in the caption
     for word in delete_words:
         original_caption = original_caption.replace(word, '  ')
     for word, replace_word in replacements.items():
         original_caption = original_caption.replace(word, replace_word)
 
-    # Append custom caption if available
     return f"{original_caption}\n\n__**{custom_caption}**__" if custom_caption else original_caption
 
     
@@ -548,7 +589,6 @@ def load_user_data(user_id, key, default_value=None):
 def load_saved_channel_ids():
     saved_channel_ids = set()
     try:
-        # Retrieve channel IDs from MongoDB collection
         for channel_doc in collection.find({"channel_id": {"$exists": True}}):
             saved_channel_ids.add(channel_doc["channel_id"])
     except Exception as e:
@@ -654,7 +694,7 @@ async def callback_query_handler(event):
 
     elif event.data == b'addsession':
         await event.respond("Send Pyrogram V2 session")
-        sessions[user_id] = 'addsession' # (If you want to enable session based login just uncomment this and modify response message accordingly)
+        sessions[user_id] = 'addsession'
 
     elif event.data == b'delete':
         await event.respond("Send words seperated by space to delete them from caption/filename ...")
@@ -677,13 +717,11 @@ async def callback_query_handler(event):
         return
 
     elif event.data == b'uploadmethod':
-        # Retrieve the user's current upload method (default to Pyrogram)
         user_data = collection.find_one({'user_id': user_id})
         current_method = user_data.get('upload_method', 'Pyrogram') if user_data else 'Pyrogram'
         pyrogram_check = " ✅" if current_method == "Pyrogram" else ""
         telethon_check = " ✅" if current_method == "Telethon" else ""
 
-        # Display the buttons for selecting the upload method
         buttons = [
             [Button.inline(f"Pyrogram v2{pyrogram_check}", b'pyrogram')],
             [Button.inline(f"SpyLib v1 ⚡{telethon_check}", b'telethon')]
@@ -741,7 +779,7 @@ async def callback_query_handler(event):
 
 @gf.on(events.NewMessage(func=lambda e: e.sender_id in pending_photos))
 async def save_thumbnail(event):
-    user_id = event.sender_id  # Use event.sender_id as user_id
+    user_id = event.sender_id
 
     if event.photo:
         temp_path = await event.download_media()
@@ -753,15 +791,13 @@ async def save_thumbnail(event):
     else:
         await event.respond('Please send a photo... Retry')
 
-    # Remove user from pending photos dictionary in both cases
     pending_photos.pop(user_id, None)
 
 def save_user_upload_method(user_id, method):
-    # Save or update the user's preferred upload method
     collection.update_one(
-        {'user_id': user_id},  # Query
-        {'$set': {'upload_method': method}},  # Update
-        upsert=True  # Create a new document if one doesn't exist
+        {'user_id': user_id},
+        {'$set': {'upload_method': method}},
+        upsert=True
     )
 
 @gf.on(events.NewMessage)
@@ -824,15 +860,12 @@ async def lock_command_handler(event):
     if event.sender_id not in OWNER_ID:
         return await event.respond("You are not authorized to use this command.")
     
-    # Extract the channel ID from the command
     try:
         channel_id = int(event.text.split(' ')[1])
     except (ValueError, IndexError):
         return await event.respond("Invalid /lock command. Use /lock CHANNEL_ID.")
     
-    # Save the channel ID to the MongoDB database
     try:
-        # Insert the channel ID into the collection
         collection.insert_one({"channel_id": channel_id})
         await event.respond(f"Channel ID {channel_id} locked successfully.")
     except Exception as e:
@@ -879,7 +912,6 @@ async def handle_large_file(file, sender, edit, caption):
                 )
             )
         else:
-            # Send as document
             dm = await pro.send_document(
                 LOG_GROUP,
                 document=file,
@@ -910,7 +942,6 @@ async def handle_large_file(file, sender, edit, caption):
                 reply_markup=reply_markup
             )
         else:
-            # Simple copy without protect_content or reply_markup
             await app.copy_message(
                 target_chat_id,
                 from_chat,
@@ -963,7 +994,6 @@ async def rename_file(file, sender):
 
 async def sanitize(file_name: str) -> str:
     sanitized_name = re.sub(r'[\\/:"*?<>|]', '_', file_name)
-    # Strip leading/trailing whitespaces
     return sanitized_name.strip()
     
 async def is_file_size_exceeding(file_path, size_limit):
@@ -980,48 +1010,39 @@ async def is_file_size_exceeding(file_path, size_limit):
 user_progress = {}
 
 def progress_callback(done, total, user_id):
-    # Check if this user already has progress tracking
     if user_id not in user_progress:
         user_progress[user_id] = {
             'previous_done': 0,
             'previous_time': time.time()
         }
     
-    # Retrieve the user's tracking data
     user_data = user_progress[user_id]
     
-    # Calculate the percentage of progress
     percent = (done / total) * 100
     
-    # Format the progress bar
     completed_blocks = int(percent // 10)
     remaining_blocks = 10 - completed_blocks
     progress_bar = "♦" * completed_blocks + "◇" * remaining_blocks
     
-    # Convert done and total to MB for easier reading
-    done_mb = done / (1024 * 1024)  # Convert bytes to MB
+    done_mb = done / (1024 * 1024)
     total_mb = total / (1024 * 1024)
     
-    # Calculate the upload speed (in bytes per second)
     speed = done - user_data['previous_done']
     elapsed_time = time.time() - user_data['previous_time']
     
     if elapsed_time > 0:
-        speed_bps = speed / elapsed_time  # Speed in bytes per second
-        speed_mbps = (speed_bps * 8) / (1024 * 1024)  # Speed in Mbps
+        speed_bps = speed / elapsed_time
+        speed_mbps = (speed_bps * 8) / (1024 * 1024)
     else:
         speed_mbps = 0
     
-    # Estimated time remaining (in seconds)
     if speed_bps > 0:
         remaining_time = (total - done) / speed_bps
     else:
         remaining_time = 0
     
-    # Convert remaining time to minutes
     remaining_time_min = remaining_time / 60
     
-    # Format the final output as needed
     final = (
         f"╭──────────────────╮\n"
         f"│     **__SpyLib ⚡ Uploader__**       \n"
@@ -1035,7 +1056,6 @@ def progress_callback(done, total, user_id):
         f"**__Powered by Team SPY__**"
     )
     
-    # Update tracking variables for the user
     user_data['previous_done'] = done
     user_data['previous_time'] = time.time()
     
@@ -1043,48 +1063,39 @@ def progress_callback(done, total, user_id):
 
 
 def dl_progress_callback(done, total, user_id):
-    # Check if this user already has progress tracking
     if user_id not in user_progress:
         user_progress[user_id] = {
             'previous_done': 0,
             'previous_time': time.time()
         }
     
-    # Retrieve the user's tracking data
     user_data = user_progress[user_id]
     
-    # Calculate the percentage of progress
     percent = (done / total) * 100
     
-    # Format the progress bar
     completed_blocks = int(percent // 10)
     remaining_blocks = 10 - completed_blocks
     progress_bar = "♦" * completed_blocks + "◇" * remaining_blocks
     
-    # Convert done and total to MB for easier reading
-    done_mb = done / (1024 * 1024)  # Convert bytes to MB
+    done_mb = done / (1024 * 1024)
     total_mb = total / (1024 * 1024)
     
-    # Calculate the upload speed (in bytes per second)
     speed = done - user_data['previous_done']
     elapsed_time = time.time() - user_data['previous_time']
     
     if elapsed_time > 0:
-        speed_bps = speed / elapsed_time  # Speed in bytes per second
-        speed_mbps = (speed_bps * 8) / (1024 * 1024)  # Speed in Mbps
+        speed_bps = speed / elapsed_time
+        speed_mbps = (speed_bps * 8) / (1024 * 1024)
     else:
         speed_mbps = 0
     
-    # Estimated time remaining (in seconds)
     if speed_bps > 0:
         remaining_time = (total - done) / speed_bps
     else:
         remaining_time = 0
     
-    # Convert remaining time to minutes
     remaining_time_min = remaining_time / 60
     
-    # Format the final output as needed
     final = (
         f"╭──────────────────╮\n"
         f"│     **__SpyLib ⚡ Downloader__**       \n"
@@ -1098,49 +1109,7 @@ def dl_progress_callback(done, total, user_id):
         f"**__Powered by Team SPY__**"
     )
     
-    # Update tracking variables for the user
     user_data['previous_done'] = done
     user_data['previous_time'] = time.time()
     
     return final
-
-# split function .... ?( to handle gareeb bot coder jo string n lga paaye)
-
-async def split_and_upload_file(app, sender, target_chat_id, file_path, caption, topic_id):
-    if not os.path.exists(file_path):
-        await app.send_message(sender, "❌ File not found!")
-        return
-
-    file_size = os.path.getsize(file_path)
-    start = await app.send_message(sender, f"ℹ️ File size: {file_size / (1024 * 1024):.2f} MB")
-    PART_SIZE =  1.9 * 1024 * 1024 * 1024
-
-    part_number = 0
-    async with aiofiles.open(file_path, mode="rb") as f:
-        while True:
-            chunk = await f.read(PART_SIZE)
-            if not chunk:
-                break
-
-            # Create part filename
-            base_name, file_ext = os.path.splitext(file_path)
-            part_file = f"{base_name}.part{str(part_number).zfill(3)}{file_ext}"
-
-            # Write part to file
-            async with aiofiles.open(part_file, mode="wb") as part_f:
-                await part_f.write(chunk)
-
-            # Uploading part
-            edit = await app.send_message(target_chat_id, f"⬆️ Uploading part {part_number + 1}...")
-            part_caption = f"{caption} \n\n**Part : {part_number + 1}**"
-            await app.send_document(target_chat_id, document=part_file, caption=part_caption, reply_to_message_id=topic_id,
-                progress=progress_bar,
-                progress_args=("╭─────────────────────╮\n│      **__Pyro Uploader__**\n├─────────────────────", edit, time.time())
-            )
-            await edit.delete()
-            os.remove(part_file)  # Cleanup after upload
-
-            part_number += 1
-
-    await start.delete()
-    os.remove(file_path)
